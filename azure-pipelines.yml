@@ -1,121 +1,74 @@
-# Feedback application
-
 trigger:
-    branches:
-      include:
-        - main
-
+  branches:
+    include:
+      - main
 pool:
-    name: iti-self-hosted
+  name: Default
 
 variables:
-    dockerHubNamespace: 'ahmedhedihed'
-    dockerRegistryServiceConnection: 'dockerhub-service-conn'
-    buildId: $(Build.BuildId)
-
-parameters:
-  - name: environment
-    type: string
-    default: dev
-    values:
-      - dev
-      - stagging
-      - prod
+  - group: my-secrets
 
 stages:
 
-- stage: CI
-  displayName: CI stage
+- stage: configure
   jobs:
-  - job: Lint
-    displayName: Linting Backend
-    steps:
-    - checkout: self
-    - task: UsePythonVersion@0
-      inputs:
-        versionSpec: '3.9'
-        addToPath: true
-    - script: |
-        python3.9 -m venv .venv
-        source .venv/bin/activate
-        pip install flake8
-        flake8 src/feedback_backend/app.py
-      displayName: 'Run Linting'
+   - job: aws
+     steps:
+      - checkout: self
+      - script: |
+            echo "Configuring AWS credentials..."
+            aws configure set aws_access_key_id $(aws_access_key_id)
+            aws configure set aws_secret_access_key $(aws_secret_access_key)
+            aws configure set region us-east-1
+            if [ -n "$(aws_session_token)" ]; then
+              aws configure set aws_session_token $(aws_session_token)
+            fi
+            aws sts get-caller-identity
+        displayName: 'Configure AWS Credentials'
+        env:
+            AWS_ACCESS_KEY_ID: $(aws_access_key_id)
+            AWS_SECRET_ACCESS_KEY: $(aws_secret_access_key)
+            AWS_SESSION_TOKEN: $(aws_session_token)
+      - script: |
+             echo "Checking AWS credentials..."
+             echo "AWS_ACCESS_KEY_ID: $(aws_access_key_id)"
+             echo "AWS_SECRET_ACCESS_KEY: $(aws_secret_access_key)"
+             echo "AWS_SESSION_TOKEN: $(aws_session_token)" 
+        displayName: 'Check AWS Credentials'
 
-  - job: Test
-    dependsOn: Lint
-    displayName: Unit Test Backend
-    steps:
-    - checkout: self
-    - script: |
-        python3.9 -m venv .venv
-        source .venv/bin/activate
-        pip install -r src/feedback_backend/requirements.txt
-        pip install pytest
-        pytest
-      displayName: 'Run Unit Test'
-      workingDirectory: $(Build.SourcesDirectory)
 
-  - job: Build
-    dependsOn: [Lint, Test]
-    displayName: Build and Push
-    steps:
-    - checkout: self
-    
-    - task: Docker@2
-      displayName: Build and Push Backend Image
-      inputs:
-        containerRegistry: $(dockerRegistryServiceConnection)
-        repository: $(dockerHubNamespace)/feedback-backend
-        command: 'buildAndPush'
-        Dockerfile: 'src/feedback_backend/Dockerfile'
-        tags: $(Build.BuildId)
-        buildContext: '$(Build.SourcesDirectory)/src/feedback_backend'
-
-    - task: Docker@2
-      displayName: Build and Push Frontend Image
-      inputs:
-        containerRegistry: $(dockerRegistryServiceConnection)
-        repository: $(dockerHubNamespace)/feedback-frontend
-        command: 'buildAndPush'
-        Dockerfile: 'src/feedback_frontend/Dockerfile'
-        tags: $(Build.BuildId)
-        buildContext: '$(Build.SourcesDirectory)/src/feedback_frontend'
-
-- stage: CD
-  displayName: CD stage
-  dependsOn: CI
+- stage: provision
+  dependsOn: configure
   jobs:
-  - deployment: DeployToEKS
-    displayName: Deploy to EKS
-    environment: ${{ parameters.environment }}
-    strategy:
-        runOnce:
-            deploy:
-                steps:
-                - checkout: self
-                - task: ReplaceTokens@5
-                  inputs:
-                    rootDirectory: '$(Build.SourcesDirectory)/k8s'
-                    targetFiles: "**/*.yaml"
-                    tokenPattern: custom
-                    tokenPrefix: '${'
-                    tokenSuffix: '}'
-                    verbosity: detailed
-                    escapeType: json
+    - job: Terraform
+      steps:
+        - script: terraform fmt
+          displayName: 'Terraform Format'
+          condition: succeeded()
 
-                - task: AWSShellScript@1
-                  displayName: 'Login to EKS Cluster'
-                  inputs:
-                    awsCredentials: 'aws-eks-service-connection'   # replace with your real connection name
-                    regionName: 'us-east-1'
-                    scriptType: 'inline'
-                    inlineScript: |
-                      echo "Logging in to EKS cluster"
-                      aws eks update-kubeconfig \
-                        --region us-east-1 \
-                        --name eks-stagging-cluster
+        - script: terraform init
+          displayName: 'Terraform Init'
+          condition: succeeded()
 
-                - script: |
-                    kubectl apply -f $(Build.SourcesDirectory)/k8s/ -n ${{ parameters.environment }}
-                  displayName: 'Deploy to EKS with kubectl'
+        - script: terraform plan -out=tfplan
+          displayName: 'Terraform Plan'
+          condition: succeeded()
+
+        - script: terraform apply -auto-approve tfplan
+          displayName: 'Terraform Apply'
+          condition: succeeded()
+
+- stage: availableilbility
+  dependsOn: provision
+  jobs:
+    - job: k8s
+      steps:
+        - checkout: self
+        - script: |
+            aws eks update-kubeconfig --region us-east-1 --name my-eks-cluster
+          displayName: 'Update kubeconfig'
+          
+        - script: |
+            kubectl get nodes -A
+          displayName: 'Check nodes'
+          condition: succeeded()
